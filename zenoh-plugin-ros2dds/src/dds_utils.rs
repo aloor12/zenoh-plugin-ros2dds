@@ -38,6 +38,30 @@ pub const DDS_ENTITY_NULL: dds_entity_t = 0;
 pub const CDR_HEADER_LE: [u8; 4] = [0, 1, 0, 0];
 pub const CDR_HEADER_BE: [u8; 4] = [0, 0, 0, 0];
 
+// DDS endpoints retain their own reference to their topic. The creator's
+// reference must be released on both success and error paths; otherwise each
+// route recreation leaks a participant child and eventually overflows the
+// bundled CycloneDDS participant reference count.
+struct OwnedTopic(dds_entity_t);
+
+impl OwnedTopic {
+    fn new(handle: dds_entity_t) -> Result<Self, String> {
+        if handle <= 0 {
+            Err(format!("Error creating DDS Topic: retcode={handle}"))
+        } else {
+            Ok(Self(handle))
+        }
+    }
+}
+
+impl Drop for OwnedTopic {
+    fn drop(&mut self) {
+        if let Err(e) = delete_dds_entity(self.0) {
+            tracing::warn!("Error releasing DDS topic creator reference: {e}");
+        }
+    }
+}
+
 /// Return None if the buffer is shorter than a CDR header (4 bytes).
 /// Otherwise, return true if the encoding flag (last bit of 2nd byte) corresponds little endian
 pub fn is_cdr_little_endian(cdr_buffer: &[u8]) -> Option<bool> {
@@ -134,11 +158,16 @@ pub unsafe fn create_topic(
     type_info: &Option<Arc<TypeInfo>>,
     keyless: bool,
 ) -> dds_entity_t {
-    let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
-    let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
+    let cton = CString::new(topic_name).unwrap();
+    let ctyn = CString::new(type_name).unwrap();
 
     match type_info {
-        None => cdds_create_blob_topic(dp, cton, ctyn, keyless),
+        None => cdds_create_blob_topic(
+            dp,
+            cton.as_ptr().cast_mut(),
+            ctyn.as_ptr().cast_mut(),
+            keyless,
+        ),
         Some(type_info) => {
             let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
 
@@ -149,13 +178,19 @@ pub unsafe fn create_topic(
                 500000000,
                 &mut descriptor,
             );
-            let mut topic: dds_entity_t = 0;
             if ret == (DDS_RETCODE_OK as i32) {
-                topic = dds_create_topic(dp, descriptor, cton, std::ptr::null(), std::ptr::null());
-                assert!(topic >= 0);
+                let topic = dds_create_topic(
+                    dp,
+                    descriptor,
+                    cton.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
                 dds_delete_topic_descriptor(descriptor);
+                topic
+            } else {
+                ret
             }
-            topic
         }
     }
 }
@@ -167,13 +202,10 @@ pub fn create_dds_writer(
     keyless: bool,
     qos: Qos,
 ) -> Result<dds_entity_t, String> {
-    let cton = CString::new(topic_name).unwrap().into_raw();
-    let ctyn = CString::new(type_name).unwrap().into_raw();
-
     unsafe {
-        let t = cdds_create_blob_topic(dp, cton, ctyn, keyless);
+        let topic = OwnedTopic::new(create_topic(dp, &topic_name, &type_name, &None, keyless))?;
         let qos_native = qos.to_qos_native();
-        let writer: i32 = dds_create_writer(dp, t, qos_native, std::ptr::null_mut());
+        let writer: i32 = dds_create_writer(dp, topic.0, qos_native, std::ptr::null_mut());
         Qos::delete_qos_native(qos_native);
         if writer >= 0 {
             Ok(writer)
@@ -281,7 +313,14 @@ where
     F: Fn(&DDSRawSample) + std::marker::Send + 'static,
 {
     unsafe {
-        let t = create_topic(dp, &topic_name, &type_name, type_info, keyless);
+        let topic = OwnedTopic::new(create_topic(
+            dp,
+            &topic_name,
+            &type_name,
+            type_info,
+            keyless,
+        ))?;
+        let t = topic.0;
         match read_period {
             None => {
                 // Use a Listener to route data as soon as it arrives
@@ -320,6 +359,10 @@ where
                 });
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
+                Qos::delete_qos_native(qos_native);
+                if reader < 0 {
+                    return Err(format!("Error creating DDS Reader: retcode={reader}"));
+                }
                 task::spawn(async move {
                     // loop while reader's instance handle remain the same
                     // (if reader was deleted, its dds_entity_t value might have been
@@ -355,6 +398,64 @@ where
                 });
                 Ok(reader)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod topic_lifetime_tests {
+    use super::*;
+
+    // Explicit opt-in: opens an isolated loopback-only DDS domain, not a robot
+    // domain. Crosses the bundled DDS's 14-bit participant-child count limit.
+    #[test]
+    #[ignore = "isolated DDS stress test; run explicitly with --ignored"]
+    fn route_churn_releases_topic_children() {
+        unsafe {
+            let xml = CString::new(concat!(
+                "<CycloneDDS><Domain><General><Interfaces>",
+                "<NetworkInterface name=\"lo\"/></Interfaces>",
+                "<AllowMulticast>false</AllowMulticast></General>",
+                "<Discovery><ParticipantIndex>none</ParticipantIndex></Discovery>",
+                "</Domain></CycloneDDS>"
+            ))
+            .unwrap();
+            let domain = dds_create_domain(219, xml.as_ptr());
+            assert!(domain > 0);
+            let dp = dds_create_participant(219, std::ptr::null(), std::ptr::null());
+            assert!(dp > 0);
+            for i in 0..20_000 {
+                let endpoint = if i % 2 == 0 {
+                    create_dds_reader(
+                        dp,
+                        "rt/offline_topic_lifetime".into(),
+                        "std_msgs::msg::dds_::String_".into(),
+                        &None,
+                        true,
+                        Qos::default(),
+                        None,
+                        |_| {},
+                    )
+                } else {
+                    create_dds_writer(
+                        dp,
+                        "rt/offline_topic_lifetime".into(),
+                        "std_msgs::msg::dds_::String_".into(),
+                        true,
+                        Qos::default(),
+                    )
+                }
+                .expect("route creation must survive reference-count boundary");
+                get_guid(&endpoint).expect("releasing topic must preserve endpoint");
+                delete_dds_entity(endpoint).unwrap();
+                assert_eq!(
+                    dds_get_children(dp, std::ptr::null_mut(), 0),
+                    0,
+                    "iteration {i} left a participant child"
+                );
+            }
+            delete_dds_entity(dp).unwrap();
+            delete_dds_entity(domain).unwrap();
         }
     }
 }
