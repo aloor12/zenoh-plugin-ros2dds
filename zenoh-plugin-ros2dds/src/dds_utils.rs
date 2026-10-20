@@ -417,6 +417,7 @@ mod topic_lifetime_tests {
                 "<NetworkInterface name=\"lo\"/></Interfaces>",
                 "<AllowMulticast>false</AllowMulticast></General>",
                 "<Discovery><ParticipantIndex>none</ParticipantIndex></Discovery>",
+                "<Tracing><Verbosity>warning</Verbosity></Tracing>",
                 "</Domain></CycloneDDS>"
             ))
             .unwrap();

@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
   const char *xml = "<CycloneDDS><Domain><General><Interfaces>"
     "<NetworkInterface name=\"lo\"/></Interfaces><AllowMulticast>false</AllowMulticast>"
     "</General><Discovery><ParticipantIndex>none</ParticipantIndex></Discovery>"
-    "</Domain></CycloneDDS>";
+    "<Tracing><Verbosity>warning</Verbosity></Tracing></Domain></CycloneDDS>";
   dds_entity_t domain = dds_create_domain(219, xml);
   dds_entity_t participant = dds_create_participant(219, NULL, NULL);
   if (domain < 0 || participant < 0) return 2;
